@@ -1,10 +1,12 @@
 package Parse::Constructor::Arguments;
 
-use 5.010;
-
-use PPI::Dumper;
-
+#ABSTRACT: Parse Moose constructor arguments using PPI
 use MooseX::Declare;
+
+BEGIN
+{
+    *DEBUG = sub () { 0 } unless defined *DEBUG{CODE};
+}
 
 class Parse::Constructor::Arguments
 {
@@ -21,61 +23,157 @@ class Parse::Constructor::Arguments
     has current =>
     (
         is          => 'ro',
-        isa         => 'PPI::Node',
+        isa         => 'PPI::Element',
         lazy        => 1,
+        builder     => '_build_current',
         writer      => '_set_current',
     );
 
     has input   =>
     (
-        is          => 'ro'
+        is          => 'ro',
         isa         => Str,
         required    => 1,
     );
 
-    method _build_document()
+    method _build_current()
     {
-        my $document = PPI::Document->new(\{$self->input});
-        $document->add_element(PPI::Statement::Null->new(';'));
-        $sef->get_first_significant_token;
-    }
+        # our first token should be significant
+        my $token = $self->document->first_token;
 
-    method parse(ClassName $class: Str $str)
-    {
-        my $self = $class->new(input => %str);
+        if($token->significant)
+        {
+            return $token;
+        }
         
-        my %data;
         while(1)
         {
-            my $token = $self->current;
+            $token = $token->next_token;
+            die "No more significant tokens in stream: '$token'" if not $token;
+            return $token if $token->significant;
+        }
+    }
 
-            say "token: $token";
-            
-            if($token->isa('PPI::Token::Word'))
+    method _build_document()
+    {
+        my $input = $self->input;
+        my $document = PPI::Document->new(\$input);
+        return $document;
+    }
+
+=method parse(ClassName $class: Str $str)
+
+This is a class method used for parsing constructor arguments. It takes a
+string that will be used as the basis of the PPI::Document. Returns a hashref
+where the keys are the named arguments and the values are the actual values to
+those named arguments. (eg. q|foo => ['bar']| returns { foo => ['bar'] })
+
+=cut
+
+    # states:
+    # 0 - Looking for a Word or Literal to use as a key
+    # 1 - Looking for a comma operator
+    # 2 - Looking for a value
+    method parse(ClassName $class: Str $str)
+    {
+        my $self = $class->new(input => $str);
+
+        # grab the current token, which should be the first significant token
+        my $token = $self->current;
+        
+        # what we are building
+        my %data;
+
+        # state related parsing variables
+        my $key;
+        my $state = 0;
+        
+        while(1)
+        {
+            if($state == 0)
             {
-                say "word: $token";
-                my $key = $token->content;
-                
-                $data{$key} = undef;
-
-                $token = $self->get_next_significant;
-
-                if($token->isa('PPI::Token::Operator') && $token->content =~ /,|(?:=>)/)
+                if($token->isa('PPI::Token::Word'))
                 {
-                    say "comma: $token";
-
-                    $token = $self->get_next_significant;
-                    
-                    if($token->parent->isa('PPI::Structure::Constructor'))
-                    {
-                        say "constructor: $token";
-                        
-                        $data{$key} = $self->process;
-                    }
+                    DEBUG && warn "Word Key: $token";
+                    $key = $token->content;
                 }
+                elsif($token->isa('PPI::Token::Quote::Single') or $token->isa('PPI::Token::Quote::Literal'))
+                {
+                    DEBUG && warn "Quote Key: $token";
+                    $key = $token->literal;
+                }
+                else
+                {
+                    die "Invalid state: Expected a Word or Literal but got '$token'";
+                }
+                
+                $state++;
             }
-            elsif($token->parent->isa('PPI::Statement::Null'))
+            elsif($state == 1)
             {
+                if($token->isa('PPI::Token::Operator') && $token->content =~ /,|=>/)
+                {
+                    DEBUG && warn "Comma: $token";
+                }
+                else
+                {
+                    die "Invalid state: Expected a Comma operator, but got '$token'";
+                }
+                
+                $state++;
+            }
+            elsif($state == 2)
+            {
+                if($token->isa('PPI::Token::Quote::Single') or $token->isa('PPI::Token::Quote::Literal'))
+                {
+                    DEBUG && warn "Quote Value: $token";
+                    $data{$key} = $token->literal;
+                }
+                elsif($token->isa('PPI::Token::Structure'))
+                {
+                    my $content = $token->content;
+                    die "Unsupported structure '$content'"
+                        if $content ne '[' and $content ne '{';
+
+                    DEBUG && warn 'Constructor: ' . $token->parent;
+                    $data{$key} = $self->process;
+                }
+                elsif($token->isa('PPI::Token::Number'))
+                {
+                    DEBUG && warn "Number: $token";
+                    $data{$key} = $token->literal;
+                }
+                else
+                {
+                    die "Invalid state: Expected Literal, Number or Structure, but got '$token'";
+                }
+                
+                $state++;
+                $key = undef;
+            }
+            elsif($state == 3)
+            {
+                if($token->isa('PPI::Token::Operator') && $token->content =~ /,|=>/)
+                {
+                    DEBUG && warn "Comma: $token";
+                }
+                else
+                {
+                    die "Invalid state: Expected a Comma operator, but got '$token'";
+                }
+
+                $state = 0;
+            }
+            
+            if(my $t = $self->peek_next_token)
+            {
+                DEBUG && warn "Peeked and took $t";
+                $token = $t;
+                $self->_set_current($token);
+            }
+            else
+            {
+                DEBUG && warn "Peeked and there were no more tokens";
                 last;
             }
         }
@@ -85,103 +183,133 @@ class Parse::Constructor::Arguments
 
     method process()
     {
-        my $data;
-        my $applicator;
-        my $terminator;
-        my $current = $self->current;
+        my ($data, $applicator, $terminator, $word, $token);
         
-        if($current->content eq '[')
+        if($self->current->content eq '[')
         {
+            DEBUG && warn "Processing Array...";
             $data = [];
             $terminator = ']';
-            $applicator = sub { push(@$_[0], $_[2]) };
+            $applicator = sub { push(@{$_[0]}, $_[2]) };
         }
-        elsif($current->content eq '{')
+        else
         {
+            DEBUG && warn "Processing Hash...";
             $data = {};
             $terminator = '}';
             $applicator = sub { $_[0]->{$_[1]} = $_[2] };
         }
 
-        my $token = $self->get_next_significant;
-        my $word;
-        my $prev;
+        $token = $self->get_next_significant;
 
         while($token->content ne $terminator)
         {
-            my $class = $token->class;
-
-            if($class eq 'PPI::Token::Word')
+            # words are stored until we know if they are a key or a value
+            if($token->isa('PPI::Token::Word'))
             {
+                DEBUG && warn "Process Word: $token";
                 $word = $token->content;
                 $token = $self->get_next_significant;
-                $class = $token->class;
             }
 
-            if($class eq 'PPI::Token::Number')
+            if($token->isa('PPI::Token::Number'))
             {
+                DEBUG && warn "Process Number: $token";
                 $applicator->($data, $word, $token->content);
                 $word = undef;
             }
-            elsif($class eq 'PPI::Token::Structure')
+            elsif($token->isa('PPI::Token::Structure'))
             {
+                DEBUG && warn "Process Structure: $token";
                 $applicator->($data, $word, $self->process);
                 $word = undef;
             }
-            elsif($class eq 'PPI::Token::Quote')
+            elsif($token->isa('PPI::Token::Quote::Single') || $token->isa('PPI::Token::Quote::Literal'))
             {
-                die 'Double quoted or interpolated strings are not supported'
-                    if $token->isa('PPI::Token::Quote::Double') or
-                    if $token->isa('PPI::Token::Quote::Interpolated');
-                
-                $applicator->($data, $word, $token->content);
-                $word = undef;
+                DEBUG && warn "Process Quote: $token";
+                if(!$word && $terminator eq '}')
+                {
+                    DEBUG && warn "Process Hash Key Quote: $token";
+                    $word = $token->literal;
+                    $token = $self->get_next_significant;
+                    next;
+                }
 
+                $applicator->($data, $word, $token->literal);
+                $word = undef;
             }
-            elsif($class eq 'PPI::Token::Operator')
+            elsif($token->isa('PPI::Token::QuoteLike::Words') and $terminator ne '}')
             {
+                # This seems to be the only way to get the fuckin data from this token
+                # which is completely retarded. Need to file a bug with PPI on this
+                DEBUG && warn "Process QuoteLike Words: $token";
+                
+                my $operator = $token->{operator};
+                my $separator = $token->{separator};
+                my $content = $token->content;
+                $content =~ s/$operator|$separator//g;
+                
+                $applicator->($data, undef, $_) for split(' ', $content);
+            }
+            elsif($token->isa('PPI::Token::Operator'))
+            {
+                DEBUG && warn "Process Comma: $token";
                 if($token->content =~ /,|=>/)
                 {
+                    $token = $self->get_next_significant;
                     next;
                 }
             }
-
+            
+            # now we process our words if they haven't been consumed
+            DEBUG && warn "Process Add Word: $word" if $word;
             $applicator->($data, undef, $word) if $word;
             $word = undef;
-        }
 
-        return $array;
+            $token = $self->get_next_significant;
+        }
+        
+        DEBUG && warn "Returning From Processing";
+        return $data;
     }
 
     method get_next_significant()
     {
+        my $token = $self->current;
+        
+        DEBUG && warn "Current: $token";
         while(1)
         {
-            $token = $self->current->next_token;
-            die "No more significant tokens in stream: '$token'" if not $token;
+            $token = $token->next_token;
+            die 'No more significant tokens in stream: '. $self->document if not $token;
             
             if(!$token->significant)
             {
                 next;
             }
-
+            
+            DEBUG && warn "Significant: $token";
             $self->_set_current($token);
             return $token;
         }
     }
 
-    method get_first_signficant_token()
+    method peek_next_token()
     {
-        my $token = $self->document->first_token;
-        
-        if($token->significant)
+        my $token = $self->current;
+
+        while(1)
         {
-            $self->_set_current($token);
-            return $token;
+            $token = $token->next_token;
+            return 0 if not $token;
+            return $token if $token->significant;
         }
-        
-        return $self->get_next_significant($token);
     }
 }
 
-Parse::Constructor::Arguments->parse(q|hello_world => [ 'wtf', 'mtfnpy' ], test_two => { hello => 'two'}|);
+1;
+__END__
+=head1 DESCRIPTION
+Parse::Constructor::Arguments parses Moose-style constructor arguments into a 
+usable data structure using PPI to accomplish the task. It exports nothing 
+and the only public method is a class method: parse.
